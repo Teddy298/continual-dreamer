@@ -59,7 +59,7 @@ class Replay:
         # total_steps / eps is the total number of steps / eps seen over the course of training
         # loaded_steps / eps is the total number of steps / eps in the replay buffer
         # filename -> key -> value_sequence
-        self._complete_eps, self._tasks, self._reward_eps = load_episodes(
+        self._complete_eps, self._tasks, self._reward_eps, self._task_index = load_episodes(
             directory=self._directory,
             capacity=capacity,
             minlen=minlen,
@@ -250,7 +250,7 @@ class Replay:
 
 
     def _generate_chunks(self, length, oversampling):
-        sequence = self._sample_sequence(oversampling)
+        sequence, index_of_task = self._sample_sequence(oversampling)
 
         while True:
             chunk = collections.defaultdict(list)
@@ -263,26 +263,25 @@ class Replay:
                     chunk[key].append(value)
                 added += len(adding['action'])
                 if len(sequence['action']) < 1:
-                    sequence = self._sample_sequence(oversampling)
+                    sequence, index_of_task = self._sample_sequence(oversampling)
             chunk = {k: np.concatenate(v) for k, v in chunk.items()}
+            chunk["task_index"] = index_of_task
             yield chunk
 
     def _sample_sequence(self, oversampling):
         episodes_keys = list(self._complete_eps.keys())
-        episodes = list(self._complete_eps.values())
         if self._ongoing:
-            episodes_keys += [k for k, v in self._ongoing_eps.items() if eplen(v) >= self._minlen]
-            episodes += [
-                x for x in self._ongoing_eps.values()
-                if eplen(x) >= self._minlen]
+            episodes_keys += [
+                k for k, v in self._ongoing_eps.items()
+                if eplen(v) >= self._minlen]
         if self._reward_sampling:
             rewards = list(self._reward_eps.values())
             # if there is a mismatch in lengths lets sync the rewards with self._complete_eps()
             if len(rewards) != len(episodes_keys):
                 print("Syncing eps _reward_eps and _complete_eps")
-                _, _, self._reward_eps = load_episodes(self._directory,
-                                                       self.capacity, self.minlen, self._coverage_sampling,
-                                                       self._coverage_sampling_args, check=False)
+                _, _, self._reward_eps, _ = load_episodes(self._directory,
+                                                          self.capacity, self.minlen, self._coverage_sampling,
+                                                          self._coverage_sampling_args, check=False)
                 rewards = list(self._reward_eps.values())
             e_r = np.exp(rewards - np.max(rewards))
             rewards_norm = e_r / e_r.sum()
@@ -297,33 +296,34 @@ class Replay:
             e_unc = np.exp(uncertainties - np.max(uncertainties))
             uncertainty_norm = e_unc / e_unc.sum()
             episode_key = np.random.choice(
-                list(self._episodes_uncertainties.keys()),
+                uncertainties,
                 p=uncertainty_norm
             )
             self._logger.scalar("replay/uncertainty", self._episodes_uncertainties[episode_key])
         elif oversampling:
-            episodes_0 = []
-            episodes_1 = []
-
-            for epi in episodes:
-                if epi["task_index"] == 0:
-                    episodes_0.append(epi)
-                elif epi["task_index"] == 1:
-                    episodes_1.append(epi)
-
-            if np.random.uniform(0, 1) < 0.99 and len(episodes_1) > 0:
-                i = np.random.randint(0, len(episodes_1))
-                episode = episodes_1[i]
-            elif len(episodes_0) > 0:
-                i = np.random.randint(0, len(episodes_0))
-                episode = episodes_0[i]
+            indexes = list(self._task_index.values())
+            # if there is a mismatch in lengths lets sync the rewards with self._complete_eps()
+            if len(indexes) != len(episodes_keys):
+                _, _, _, self._task_index = load_episodes(self._directory,
+                                                          self._capacity, self._minlen, self._coverage_sampling,
+                                                          self._coverage_sampling_args, check=False)
+                indexes = list(self._task_index.values())
+            zeros = indexes.count(0)
+            ones = indexes.count(1)
+            if ones == 0 or zeros == 0:
+                episode_key = self._random.choice(episodes_keys)
             else:
-                i = np.random.randint(0, len(episodes_1))
-                episode = episodes_1[i]
-
+                f = lambda x: 0.01 / zeros if x == 0 else 0.99 / ones
+                indexes_norm = [f(x) for x in indexes]
+                episode_key = np.random.choice(episodes_keys, p=indexes_norm)
         else:
             episode_key = self._random.choice(episodes_keys)
-            episode = self._complete_eps[episode_key]
+
+        episode = self._complete_eps[episode_key]
+        info = parse_episode_name(episode_key)
+        self._logger.scalar("replay/total_episode", info['total_episodes'])
+        self._logger.scalar("replay/task", info['task'])
+
         total = len(episode['action'])
         length = total
         if self._maxlen:
@@ -336,7 +336,7 @@ class Replay:
         if self._prioritize_ends:
             upper += self._minlen
         index = min(self._random.randint(upper), total - length)
-
+        index_of_task = episode["task_index"]
         sequence = {
             k: convert(v[index: index + length])
             for k, v in episode.items() if not k.startswith(('log_', "task_index"))}
@@ -344,8 +344,7 @@ class Replay:
         sequence['is_first'][0] = True
         if self._maxlen:
             assert self._minlen <= len(sequence['action']) <= self._maxlen
-
-        return sequence
+        return sequence, index_of_task
 
     def _check_if_uncertainties_available(self):
         keys_to_use = list(self._complete_eps.keys())
@@ -388,6 +387,7 @@ class Replay:
             del self._complete_eps[str(candidate)]
             del self._tasks[str(candidate)]
             del self._reward_eps[str(candidate)]
+            del self._task_index[str(candidate)]
             if str(candidate) in self._episodes_uncertainties:
                 del self._episodes_uncertainties[str(candidate)]
         
@@ -470,6 +470,8 @@ def load_episodes(directory, capacity=None, minlen=1, coverage_sampling=False, c
     episodes = {}
     tasks = {}
     rewards_eps = {}
+    indexes = {}
+
     for filename in filenames:
         try:
             with filename.open('rb') as f:
@@ -482,6 +484,7 @@ def load_episodes(directory, capacity=None, minlen=1, coverage_sampling=False, c
         task = int(str(os.path.basename(filename)).split('-')[2])
         tasks[str(filename)] = task
         rewards_eps[str(filename)] = episode['reward'].astype(np.float64).sum()
+        indexes[str(filename)] = episode['task_index'].astype(np.float64).sum()  #
 
     # Collas rebuttal check for duplicate episodes
     # First run a CL run without deleteing the replay buffer
@@ -511,7 +514,7 @@ def load_episodes(directory, capacity=None, minlen=1, coverage_sampling=False, c
             i += 1
         sys.exit("Finished check")
     
-    return episodes, tasks, rewards_eps
+    return episodes, tasks, rewards_eps, indexes
 
 def parse_episode_name(episode_name):
     episode_name = os.path.basename(episode_name)
